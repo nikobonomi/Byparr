@@ -10,6 +10,7 @@ from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Route
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
+from src import cookies as cookie_jar
 from src.challenge import challenge_present, solve_challenge
 from src.content import build_response_content
 from src.models import (
@@ -65,6 +66,7 @@ async def read_item(request: LinkRequest, dep: BrowserDep) -> LinkResponse:
     timer = TimeoutTimer(duration=request.max_timeout)
     request.url = request.url.replace('"', "").strip()
 
+    await cookie_jar.load(dep.context, dep.proxy_key)
     await setup_routes(request, dep)
 
     try:
@@ -85,6 +87,7 @@ async def read_item(request: LinkRequest, dep: BrowserDep) -> LinkResponse:
         ) from e
 
     cookies = await dep.context.cookies()
+    await cookie_jar.store(dep.context, dep.proxy_key)
     content_type, response_content = await build_response_content(
         dep.page,
         request,
@@ -198,6 +201,9 @@ async def _navigate_and_solve(
         return False, page_html, page_request
 
     await solve_challenge(dep.page, timer)
+    # Persist the clearance now: a request that later dies on networkidle
+    # still earned a cookie worth keeping for the next one.
+    await cookie_jar.store(dep.context, dep.proxy_key)
     await _wait_for_networkidle(dep, timer)
     return True, page_html, page_request
 

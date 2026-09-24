@@ -1,4 +1,5 @@
 import base64
+import time
 from http import HTTPStatus
 from json import JSONDecodeError
 from unittest.mock import AsyncMock, MagicMock
@@ -11,12 +12,22 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from starlette.testclient import TestClient
 
 from main import app
+from src import cookies as cookie_jar
 from src.challenge import CF_INTERSTITIAL_INDICATORS_SELECTORS
 from src.endpoints import read_item
 from src.models import LinkRequest
 from src.utils import BrowserDepClass, TimeoutTimer, remaining_ms
 
 client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def clean_cookie_jar():
+    """Keep the module-level jar from leaking between tests."""
+    cookie_jar.reset()
+    yield
+    cookie_jar.reset()
+
 
 test_websites = [
     "https://ext.to/",
@@ -375,6 +386,7 @@ def fake_dep(
     marker_counts: list[int] | None = None,
     widget_box: dict[str, float] | None = None,
     user_agent: str | None = "UnitTestBrowser/1.0",
+    proxy_key: str = "",
 ) -> BrowserDepClass:
     """Build a browser dependency pair backed by mocks."""
     page = AsyncMock()
@@ -413,7 +425,7 @@ def fake_dep(
 
     context = AsyncMock()
     context.cookies.return_value = []
-    return BrowserDepClass(page=page, context=context)
+    return BrowserDepClass(page=page, context=context, proxy_key=proxy_key)
 
 
 @pytest.mark.asyncio
@@ -548,3 +560,87 @@ async def test_marker_vanishing_mid_navigation_is_not_a_solved_challenge():
         )
 
     assert exc.value.status_code == HTTPStatus.REQUEST_TIMEOUT
+
+
+CLEARANCE = {
+    "name": "cf_clearance",
+    "value": "abc123",
+    "domain": ".example.test",
+    "path": "/",
+    "expires": time.time() + 600,
+    "httpOnly": True,
+    "secure": True,
+    "sameSite": "Lax",
+}
+
+
+@pytest.mark.asyncio
+async def test_cookies_from_one_request_are_reused_by_the_next():
+    """A clearance minted by one request must be injected before the next goto."""
+    first = fake_dep()
+    first.context.cookies.return_value = [CLEARANCE]
+    await read_item(LinkRequest(url="https://example.test/login"), first)
+
+    second = fake_dep()
+    order = MagicMock()
+    order.attach_mock(second.context.add_cookies, "add_cookies")
+    order.attach_mock(second.page.goto, "goto")
+    await read_item(LinkRequest(url="https://example.test/login"), second)
+
+    second.context.add_cookies.assert_awaited_once_with([CLEARANCE])
+    assert order.mock_calls[0][0] == "add_cookies", "cookies must land before goto"
+
+
+@pytest.mark.asyncio
+async def test_expired_cookies_are_never_reinjected():
+    """An expired clearance is worthless; loading it would just mask a fresh solve."""
+    stale = {**CLEARANCE, "expires": time.time() - 10}
+    first = fake_dep()
+    first.context.cookies.return_value = [stale]
+    await read_item(LinkRequest(url="https://example.test/login"), first)
+
+    second = fake_dep()
+    await read_item(LinkRequest(url="https://example.test/login"), second)
+
+    second.context.add_cookies.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_clearance_is_not_shared_across_proxies():
+    """cf_clearance is IP-bound: a jar entry from one egress must not reach another."""
+    direct = fake_dep(proxy_key="direct")
+    direct.context.cookies.return_value = [CLEARANCE]
+    await read_item(LinkRequest(url="https://example.test/login"), direct)
+
+    through_proxy = fake_dep(proxy_key="proxy.example:8080")
+    await read_item(LinkRequest(url="https://example.test/login"), through_proxy)
+    through_proxy.context.add_cookies.assert_not_awaited()
+
+    same_proxy = fake_dep(proxy_key="direct")
+    await read_item(LinkRequest(url="https://example.test/login"), same_proxy)
+    same_proxy.context.add_cookies.assert_awaited_once_with([CLEARANCE])
+
+
+@pytest.mark.asyncio
+async def test_clearance_survives_a_failure_after_the_solve():
+    """A request that dies after solving still keeps its hard-won cookie."""
+    dep = fake_dep(challenged=True, marker_counts=[1, 0])
+    dep.context.cookies.return_value = [CLEARANCE]
+
+    message = "Page.wait_for_load_state: frame detached"
+
+    def fail_networkidle(state: str, **_kwargs: object) -> None:
+        """Blow up on the post-solve wait with a non-timeout Playwright error."""
+        if state == "networkidle":
+            raise PlaywrightError(message)
+
+    dep.page.wait_for_load_state.side_effect = fail_networkidle
+
+    with pytest.raises(HTTPException) as exc:
+        await read_item(LinkRequest(url="https://example.test/login"), dep)
+
+    assert exc.value.status_code == HTTPStatus.BAD_GATEWAY
+
+    follower = fake_dep()
+    await read_item(LinkRequest(url="https://example.test/login"), follower)
+    follower.context.add_cookies.assert_awaited_once_with([CLEARANCE])

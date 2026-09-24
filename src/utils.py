@@ -50,6 +50,9 @@ def remaining_ms(timer: TimeoutTimer) -> float:
 class BrowserDepClass(NamedTuple):
     page: Page
     context: BrowserContext
+    # Resolved proxy this request goes out through; keys the cookie jar so a
+    # clearance minted on one egress IP never reaches another.
+    proxy_key: str = ""
 
 
 async def get_browser(
@@ -93,6 +96,8 @@ async def get_browser(
             "password": PROXY_PASSWORD,
         }
 
+    proxy_key = header_server or PROXY_SERVER or ""
+
     async with InvisiblePlaywright(
         headless=True,
         proxy=proxy_config,
@@ -108,4 +113,4 @@ async def get_browser(
         browser = cast("Browser", browser_raw)
         context = await browser.new_context()
         page = await context.new_page()
-        yield BrowserDepClass(page, context)
+        yield BrowserDepClass(page, context, proxy_key)
